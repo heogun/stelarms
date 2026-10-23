@@ -603,8 +603,27 @@ code {
   color: var(--bad);
 }
 
-.builder__status button {
+.builder__status-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-left: auto;
+}
+
+.builder__online-hint {
+  margin: 8px 0 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.lobby__deck-note {
+  margin: -4px 0 10px;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.lobby__deck-note a {
+  color: var(--accent, #9b8cff);
 }
 
 .warn {

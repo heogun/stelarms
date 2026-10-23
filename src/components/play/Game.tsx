@@ -294,11 +294,6 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
     ? playBlocker({ cardId: selectedEntry.cardId, used: selectedUsed })
     : null;
 
-  const foeDeck = online.seats[foeSeat]?.deckId;
-  const myDeck = online.seats[view.seat]?.deckId;
-  void foeDeck;
-  void myDeck;
-
   const leave = () => {
     if (view.phase !== "gameover") {
       const ok = window.confirm("대전에서 나가면 기권 처리됩니다. 나갈까요?");

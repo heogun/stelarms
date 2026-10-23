@@ -1,19 +1,30 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { CardView } from "./CardView";
 import { formatDamage, formatRange } from "./cardUtils";
 import type { Card, Deck, Stella } from "../data";
 import { cardsByStella, decks, stellas } from "../data";
+import { CUSTOM_DECK_NAME_MAX, validateCustomDeck } from "../data/customDeck";
+import {
+  readCustomDraft,
+  writeCustomDraft,
+  writeDeckSelection,
+} from "./play/deckStorage";
 
 const NORMAL_LIMIT = 7;
 const SPECIAL_LIMIT = 3;
 
 /** 덱 빌더 — 스트리머 2명 선택 → 통상 7 + 비장 3 구성. */
 export function DeckBuilder() {
-  const [mainId, setMainId] = useState<string>(stellas[0].id);
-  const [partnerId, setPartnerId] = useState<string>(stellas[1].id);
-  const [normals, setNormals] = useState<string[]>([]);
-  const [specials, setSpecials] = useState<string[]>([]);
-  const [deckName, setDeckName] = useState("새 덱");
+  const initial = useMemo(() => readCustomDraft(), []);
+  const [mainId, setMainId] = useState<string>(initial?.mainId ?? stellas[0].id);
+  const [partnerId, setPartnerId] = useState<string>(initial?.partnerId ?? stellas[1].id);
+  const [normals, setNormals] = useState<string[]>(initial?.normals ?? []);
+  const [specials, setSpecials] = useState<string[]>(initial?.specials ?? []);
+  const [deckName, setDeckName] = useState(initial?.name?.trim() || "새 덱");
+
+  useEffect(() => {
+    writeCustomDraft({ name: deckName, mainId, partnerId, normals, specials });
+  }, [deckName, mainId, partnerId, normals, specials]);
 
   const main = stellas.find((s) => s.id === mainId)!;
   const partner = stellas.find((s) => s.id === partnerId)!;
@@ -39,10 +50,11 @@ export function DeckBuilder() {
     }
   };
 
-  const valid =
-    normals.length === NORMAL_LIMIT &&
-    specials.length === SPECIAL_LIMIT &&
-    mainId !== partnerId;
+  const validation = useMemo(
+    () => validateCustomDeck({ name: deckName, mainId, partnerId, normals, specials }),
+    [deckName, mainId, partnerId, normals, specials],
+  );
+  const valid = validation.ok;
 
   const loadDeck = (deck: Deck) => {
     setMainId(deck.mainId);
@@ -56,6 +68,13 @@ export function DeckBuilder() {
     setNormals([]);
     setSpecials([]);
     setDeckName("새 덱");
+  };
+
+  const useInOnline = () => {
+    if (!validation.ok) return;
+    writeCustomDraft(validation.deck);
+    writeDeckSelection({ kind: "custom" });
+    window.location.hash = "#play";
   };
 
   const selectedId = new Set([...normals, ...specials]);
@@ -102,6 +121,7 @@ export function DeckBuilder() {
             <input
               type="text"
               value={deckName}
+              maxLength={CUSTOM_DECK_NAME_MAX}
               onChange={(e) => setDeckName(e.target.value)}
             />
           </label>
@@ -121,10 +141,26 @@ export function DeckBuilder() {
           <span className={valid ? "ok" : "bad"}>
             {valid ? "유효한 덱" : "미완성"}
           </span>
-          <button type="button" onClick={clear}>
-            비우기
-          </button>
+          <div className="builder__status-actions">
+            <button type="button" onClick={clear}>
+              비우기
+            </button>
+            <button
+              type="button"
+              className="btn btn--primary"
+              disabled={!valid}
+              onClick={useInOnline}
+              title={valid ? "덱을 저장하고 대전 탭으로 이동합니다." : "7+3 구성을 완성하세요."}
+            >
+              온라인 대전에 사용
+            </button>
+          </div>
         </div>
+        {!valid && (
+          <p className="builder__online-hint">
+            덱을 완성하면 대전 로비에서 이 커스텀 덱을 선택할 수 있습니다.
+          </p>
+        )}
       </section>
 
       <section className="builder__decks">

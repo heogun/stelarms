@@ -12,8 +12,8 @@
 
 import { applyAction, createMatch, hashState, isRuleError, toPlayerView } from "../src/engine";
 import type { Action, GameState, PlayerId } from "../src/engine";
-import { decks } from "../src/data/decks";
-import type { Deck } from "../src/data/types";
+import { resolveDeckChoice, seatDeckFor } from "../src/net/deckChoice";
+import type { ResolvedDeck } from "../src/net/deckChoice";
 import {
   MAX_MESSAGE_BYTES,
   MAX_NAME_LENGTH,
@@ -37,8 +37,6 @@ const RATE_PER_SEC = 6;
 const DIST_DIR = `${process.cwd()}/dist`;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-const deckTable = new Map(decks.map((deck) => [deck.id, deck]));
-
 /* ────────────────────────────── 타입 ────────────────────────────── */
 
 interface Client {
@@ -53,7 +51,7 @@ interface Client {
 interface Seat {
   token: string;
   name: string;
-  deckId: string | null;
+  deck: ResolvedDeck | null;
   client: Client | null;
   connected: boolean;
   disconnectedAt: number | null;
@@ -112,10 +110,6 @@ function normalizeCode(raw: unknown): string | null {
   return new RegExp(`^[${CODE_ALPHABET}]{${ROOM_CODE_LENGTH}}$`).test(code) ? code : null;
 }
 
-function findDeck(raw: unknown): Deck | null {
-  return typeof raw === "string" ? (deckTable.get(raw) ?? null) : null;
-}
-
 function newRoomCode(): string {
   for (let attempt = 0; attempt < 64; attempt += 1) {
     const bytes = crypto.getRandomValues(new Uint8Array(ROOM_CODE_LENGTH));
@@ -143,13 +137,13 @@ function actorOf(state: GameState): PlayerId {
   return state.pending ? state.pending.player : state.turn;
 }
 
-function lobbySeats(room: Room): (LobbySeat | null)[] {
+function lobbySeats(room: Room, viewerSeat: PlayerId): (LobbySeat | null)[] {
   return room.seats.map((seat, index) =>
     seat
       ? {
           seat: index as PlayerId,
           name: seat.name,
-          deckId: seat.deckId,
+          deck: seat.deck ? seatDeckFor(seat.deck, viewerSeat, index as PlayerId) : null,
           connected: seat.connected,
         }
       : null,
@@ -206,7 +200,7 @@ function roomMessage(room: Room, seat: PlayerId): ServerMessage {
     token: entry?.token ?? "",
     hostSeat: room.hostSeat,
     started: room.started,
-    seats: lobbySeats(room),
+    seats: lobbySeats(room, seat),
   };
 }
 
@@ -218,7 +212,7 @@ function stateMessage(room: Room, seat: PlayerId): ServerMessage | null {
     hash: room.hash,
     seq: room.seq,
     deadline: room.deadline,
-    seats: lobbySeats(room),
+    seats: lobbySeats(room, seat),
   };
 }
 
@@ -398,9 +392,9 @@ function createRoom(client: Client, message: Extract<ClientMessage, { type: "cre
     sendError(client, "server-full", "서버에 방이 너무 많습니다. 잠시 후 다시 시도하세요.");
     return;
   }
-  const deck = findDeck(message.deckId);
-  if (!deck) {
-    sendError(client, "bad-deck", "알 수 없는 덱입니다.");
+  const resolved = resolveDeckChoice(message.deck);
+  if (!resolved.ok) {
+    sendError(client, "bad-deck", resolved.error);
     return;
   }
   const code = newRoomCode();
@@ -411,7 +405,7 @@ function createRoom(client: Client, message: Extract<ClientMessage, { type: "cre
       {
         token: newToken(),
         name: sanitizeName(message.name),
-        deckId: deck.id,
+        deck: resolved.deck,
         client: null,
         connected: true,
         disconnectedAt: null,
@@ -456,15 +450,15 @@ function joinRoom(client: Client, message: Extract<ClientMessage, { type: "join"
     sendError(client, "room-full", "방이 가득 찼습니다.");
     return;
   }
-  const deck = findDeck(message.deckId);
-  if (!deck) {
-    sendError(client, "bad-deck", "알 수 없는 덱입니다.");
+  const resolved = resolveDeckChoice(message.deck);
+  if (!resolved.ok) {
+    sendError(client, "bad-deck", resolved.error);
     return;
   }
   room.seats[1] = {
     token: newToken(),
     name: sanitizeName(message.name),
-    deckId: deck.id,
+    deck: resolved.deck,
     client: null,
     connected: true,
     disconnectedAt: null,
@@ -531,14 +525,10 @@ function startRoom(client: Client): void {
     sendError(client, "not-ready", "두 플레이어가 모두 필요합니다.");
     return;
   }
-  if (!a.deckId || !b.deckId) {
-    sendError(client, "not-ready", "두 플레이어 모두 덱을 골라야 합니다.");
-    return;
-  }
-  const deckA = findDeck(a.deckId);
-  const deckB = findDeck(b.deckId);
+  const deckA = a.deck;
+  const deckB = b.deck;
   if (!deckA || !deckB) {
-    sendError(client, "bad-deck", "덱 정보가 올바르지 않습니다.");
+    sendError(client, "not-ready", "두 플레이어 모두 덱을 골라야 합니다.");
     return;
   }
   try {
@@ -568,8 +558,12 @@ function startRoom(client: Client): void {
     broadcastRoom(room);
     publish(room);
   } catch (error) {
-    console.error(`[room ${room.code}] start failed`, error);
-    sendError(client, "internal", "대전을 시작할 수 없습니다.");
+    if (isRuleError(error)) {
+      sendError(client, error.code, error.message);
+    } else {
+      console.error(`[room ${room.code}] start failed`, error);
+      sendError(client, "internal", "대전을 시작할 수 없습니다.");
+    }
   }
 }
 
@@ -624,14 +618,14 @@ function handleMessage(client: Client, raw: string | Uint8Array): void {
         sendError(client, "room-started", "이미 시작했습니다.");
         return;
       }
-      const deck = findDeck(message.deckId);
-      if (!deck) {
-        sendError(client, "bad-deck", "알 수 없는 덱입니다.");
+      const resolved = resolveDeckChoice(message.deck);
+      if (!resolved.ok) {
+        sendError(client, "bad-deck", resolved.error);
         return;
       }
       const entry = room.seats[seat];
       if (!entry) return;
-      entry.deckId = deck.id;
+      entry.deck = resolved.deck;
       room.lastActivity = Date.now();
       broadcastRoom(room);
       return;

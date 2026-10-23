@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Action } from "../engine";
 import type {
   ClientMessage,
+  DeckChoice,
   LobbySeat,
   PlayerView,
   ServerMessage,
@@ -211,26 +212,26 @@ export function useOnline() {
   }, [connected, send]);
 
   const create = useCallback(
-    (name: string, deckId: string) => {
+    (name: string, deck: DeckChoice) => {
       setError(null);
       setResuming(false);
       resumedRef.current = true;
-      send({ type: "create", name, deckId });
+      send({ type: "create", name, deck });
     },
     [send],
   );
 
   const join = useCallback(
-    (roomCode: string, name: string, deckId: string) => {
+    (roomCode: string, name: string, deck: DeckChoice) => {
       setError(null);
       setResuming(false);
       resumedRef.current = true;
-      send({ type: "join", roomCode, name, deckId });
+      send({ type: "join", roomCode, name, deck });
     },
     [send],
   );
 
-  const setDeck = useCallback((deckId: string) => send({ type: "setDeck", deckId }), [send]);
+  const setDeck = useCallback((deck: DeckChoice) => send({ type: "setDeck", deck }), [send]);
   const start = useCallback(() => send({ type: "start" }), [send]);
   const act = useCallback((action: Action) => send({ type: "action", action }), [send]);
 
