@@ -21,6 +21,22 @@ import {
   ROOM_CODE_LENGTH,
 } from "../src/net/protocol";
 import type { ClientMessage, LobbySeat, ServerMessage } from "../src/net/protocol";
+import { defaultAction } from "./defaultAction";
+import {
+  createTournament,
+  detachTournamentClient,
+  isInTournament,
+  joinTournament,
+  leaveTournament,
+  resumeTournament,
+  startTournament,
+  sweepTournaments,
+  tournamentAction,
+  tournamentBan,
+  tournamentCount,
+  tournamentDeck,
+  tournamentPick,
+} from "./tournament";
 
 /* ────────────────────────────── 설정 ────────────────────────────── */
 
@@ -272,72 +288,6 @@ function publish(room: Room, withRoom = false): void {
 
 /* ────────────────────────────── 타임아웃 ────────────────────────────── */
 
-function defaultAction(state: GameState, playerId: PlayerId): Action | null {
-  const pending = state.pending;
-  if (pending) {
-    switch (pending.kind) {
-      case "mulligan":
-        return { type: "mulligan", returnUids: [] };
-      case "startPhase":
-        return { type: "startPhase", recompose: false };
-      case "response":
-        return { type: "response" };
-      case "defend": {
-        const p = state.players[playerId];
-        const aura = pending.attack.aura;
-        const life = pending.attack.life;
-        if (aura > 0 && p.aura >= aura) return { type: "defend", choice: "aura" };
-        if (life > 0) return { type: "defend", choice: "life" };
-        return { type: "defend", choice: "aura" };
-      }
-      case "penalty":
-        return {
-          type: "penalty",
-          choice: state.players[playerId].aura > 0 ? "aura" : "life",
-        };
-      case "choice":
-        return pending.options.length > 0
-          ? { type: "choice", optionId: pending.options[0].id }
-          : null;
-      case "order":
-        return { type: "order", uids: pending.uids };
-      case "discardDown": {
-        const p = state.players[playerId];
-        const need = p.hand.length - pending.to;
-        return { type: "discardDown", uids: p.hand.slice(0, need).map((c) => c.uid) };
-      }
-    }
-  }
-  if (state.phase !== "main") return null;
-  const p = state.players[playerId];
-  if (p.flags.mode === "power" && !p.flags.powerUsed) {
-    const uids = [
-      ...p.hand.map((c) => c.uid),
-      ...p.specials.filter((s) => !s.used).map((s) => s.uid),
-    ];
-    for (const uid of uids) {
-      if (tryAction(state, playerId, { type: "playCard", uid })) {
-        return { type: "playCard", uid };
-      }
-    }
-  }
-  if (tryAction(state, playerId, { type: "endTurn" })) return { type: "endTurn" };
-  for (const card of p.hand) {
-    if (tryAction(state, playerId, { type: "playCard", uid: card.uid })) {
-      return { type: "playCard", uid: card.uid };
-    }
-  }
-  return null;
-}
-
-function tryAction(state: GameState, playerId: PlayerId, action: Action): GameState | null {
-  try {
-    return applyAction(state, playerId, action);
-  } catch {
-    return null;
-  }
-}
-
 function applyAndPublish(room: Room, seat: PlayerId, action: Action): boolean {
   if (!room.state) return false;
   try {
@@ -388,6 +338,10 @@ function createRoom(client: Client, message: Extract<ClientMessage, { type: "cre
     sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
     return;
   }
+  if (isInTournament(client.id)) {
+    sendError(client, "already-in-tournament", "이미 대회에 참가하고 있습니다.");
+    return;
+  }
   if (rooms.size >= MAX_ROOMS) {
     sendError(client, "server-full", "서버에 방이 너무 많습니다. 잠시 후 다시 시도하세요.");
     return;
@@ -432,6 +386,10 @@ function joinRoom(client: Client, message: Extract<ClientMessage, { type: "join"
     sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
     return;
   }
+  if (isInTournament(client.id)) {
+    sendError(client, "already-in-tournament", "이미 대회에 참가하고 있습니다.");
+    return;
+  }
   const code = normalizeCode(message.roomCode);
   if (!code) {
     sendError(client, "bad-room", "방 코드는 6자리입니다.");
@@ -473,6 +431,10 @@ function joinRoom(client: Client, message: Extract<ClientMessage, { type: "join"
 function resumeRoom(client: Client, message: Extract<ClientMessage, { type: "resume" }>): void {
   if (client.room) {
     sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
+    return;
+  }
+  if (isInTournament(client.id)) {
+    sendError(client, "already-in-tournament", "이미 대회에 참가하고 있습니다.");
     return;
   }
   if (typeof message.token !== "string" || message.token.length > 128) {
@@ -607,6 +569,45 @@ function handleMessage(client: Client, raw: string | Uint8Array): void {
     case "resume":
       resumeRoom(client, message);
       return;
+    case "tcreate":
+      if (client.room) {
+        sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
+        return;
+      }
+      createTournament(client, message.name);
+      return;
+    case "tjoin":
+      if (client.room) {
+        sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
+        return;
+      }
+      joinTournament(client, message.code, message.name);
+      return;
+    case "tresume":
+      if (client.room) {
+        sendError(client, "already-in-room", "이미 방에 참가하고 있습니다.");
+        return;
+      }
+      resumeTournament(client, message.code, message.token);
+      return;
+    case "tstart":
+      startTournament(client);
+      return;
+    case "tpick":
+      tournamentPick(client, message.stellas);
+      return;
+    case "tban":
+      tournamentBan(client, message.stellaId);
+      return;
+    case "tdeck":
+      tournamentDeck(client, message.deck);
+      return;
+    case "taction":
+      tournamentAction(client, message.action);
+      return;
+    case "tleave":
+      leaveTournament(client);
+      return;
     case "setDeck": {
       const room = client.room;
       const seat = client.seat;
@@ -710,7 +711,12 @@ const MIME: Record<string, string> = {
 async function serveStatic(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname === "/health") {
-    return Response.json({ ok: true, rooms: rooms.size, clients: clients.size });
+    return Response.json({
+      ok: true,
+      rooms: rooms.size,
+      tournaments: tournamentCount(),
+      clients: clients.size,
+    });
   }
   if (url.pathname === "/ws") {
     return new Response("WebSocket only", { status: 400 });
@@ -801,6 +807,7 @@ const server = Bun.serve<{ id: string }>({
       const client = clients.get(ws.data.id);
       if (!client) return;
       clients.delete(client.id);
+      detachTournamentClient(client.id);
       const room = client.room;
       const seat = client.seat;
       detachClient(client);
@@ -829,6 +836,7 @@ const server = Bun.serve<{ id: string }>({
 
 setInterval(() => {
   const now = Date.now();
+  sweepTournaments(now);
   for (const [code, room] of rooms) {
     const idle = now - room.lastActivity;
     const bothGone = room.seats.every((seat) => !seat || !seat.connected);
@@ -851,4 +859,4 @@ setInterval(() => {
 }, 60_000);
 
 console.log(`STELARMS server on http://${HOST}:${server.port} (ws://.../ws)`);
-console.log(`turn timeout: ${TURN_MS}ms, rooms: ${rooms.size}`);
+console.log(`turn timeout: ${TURN_MS}ms, rooms: ${rooms.size}, tournaments: ${tournamentCount()}`);

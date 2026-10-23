@@ -1,20 +1,23 @@
 // 온라인 대전 WebSocket 훅.
 //
-// 서버가 보내는 것: 방 정보, 플레이어별 뷰, 오류.
-// 클라이언트가 보내는 것: 방 생성/참가/재접속, 덱 변경, 액션.
+// 서버가 보내는 것: 방 정보, 플레이어별 뷰, 대회 스냅샷, 대회 경기 뷰, 오류.
+// 클라이언트가 보내는 것: 방/대회 생성·참가·재접속, 덱/픽/밴, 액션.
 // 재접속 토큰은 sessionStorage에 보관한다.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Action } from "../engine";
+import type { CustomDeckInput } from "../data/customDeck";
 import type {
   ClientMessage,
   DeckChoice,
   LobbySeat,
   PlayerView,
   ServerMessage,
+  TournamentView,
 } from "./protocol";
 
-const SESSION_KEY = "stelarms.session.v1";
+const SESSION_KEY = "stelarms.session.v2";
+const LEGACY_ROOM_SESSION_KEY = "stelarms.session.v1";
 
 export interface RoomInfo {
   roomCode: string;
@@ -30,17 +33,30 @@ export interface OnlineError {
 }
 
 interface Session {
-  roomCode: string;
+  kind: "room" | "tournament";
+  code: string;
   token: string;
 }
 
 function readSession(): Session | null {
   try {
     const raw = sessionStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<Session>;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Session>;
+      if (
+        (parsed.kind === "room" || parsed.kind === "tournament") &&
+        typeof parsed.code === "string" &&
+        typeof parsed.token === "string"
+      ) {
+        return { kind: parsed.kind, code: parsed.code, token: parsed.token };
+      }
+    }
+    // v0.6 이전의 방 세션도 계속 복원한다.
+    const legacy = sessionStorage.getItem(LEGACY_ROOM_SESSION_KEY);
+    if (!legacy) return null;
+    const parsed = JSON.parse(legacy) as { roomCode?: unknown; token?: unknown };
     if (typeof parsed.roomCode === "string" && typeof parsed.token === "string") {
-      return { roomCode: parsed.roomCode, token: parsed.token };
+      return { kind: "room", code: parsed.roomCode, token: parsed.token };
     }
   } catch {
     // ignore
@@ -59,6 +75,7 @@ function writeSession(session: Session): void {
 function clearSession(): void {
   try {
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(LEGACY_ROOM_SESSION_KEY);
   } catch {
     // ignore
   }
@@ -72,6 +89,16 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ws`;
 }
 
+const FATAL_SESSION_CODES = new Set([
+  "bad-token",
+  "room-not-found",
+  "room-expired",
+  "room-closed",
+  "tournament-not-found",
+  "tournament-expired",
+  "session-replaced",
+]);
+
 export function useOnline() {
   const socketRef = useRef<WebSocket | null>(null);
   const shouldReconnect = useRef(true);
@@ -82,6 +109,7 @@ export function useOnline() {
   const [connected, setConnected] = useState(false);
   const [resuming, setResuming] = useState(() => readSession() !== null);
   const [room, setRoom] = useState<RoomInfo | null>(null);
+  const [tournament, setTournament] = useState<TournamentView | null>(null);
   const [seats, setSeats] = useState<(LobbySeat | null)[]>([]);
   const [view, setView] = useState<PlayerView | null>(null);
   const [hash, setHash] = useState("");
@@ -98,65 +126,101 @@ export function useOnline() {
 
   const clearError = useCallback(() => setError(null), []);
 
-  const handle = useCallback((message: ServerMessage) => {
-    switch (message.type) {
-      case "welcome": {
-        setConnected(true);
-        retryRef.current = 0;
-        const session = readSession();
-        if (session && !resumedRef.current) {
-          resumedRef.current = true;
-          setResuming(true);
-          send({ type: "resume", roomCode: session.roomCode, token: session.token });
-        } else {
+  const clearMatchState = useCallback(() => {
+    setView(null);
+    setHash("");
+    setSeq(0);
+    setDeadline(null);
+  }, []);
+
+  const handle = useCallback(
+    (message: ServerMessage) => {
+      switch (message.type) {
+        case "welcome": {
+          setConnected(true);
+          retryRef.current = 0;
+          const session = readSession();
+          if (session && !resumedRef.current) {
+            resumedRef.current = true;
+            setResuming(true);
+            if (session.kind === "tournament") {
+              send({ type: "tresume", code: session.code, token: session.token });
+            } else {
+              send({ type: "resume", roomCode: session.code, token: session.token });
+            }
+          } else {
+            setResuming(false);
+          }
+          break;
+        }
+        case "room": {
+          const info: RoomInfo = {
+            roomCode: message.roomCode,
+            seat: message.seat,
+            token: message.token,
+            hostSeat: message.hostSeat,
+            started: message.started,
+          };
+          setRoom(info);
+          setTournament(null);
+          setSeats(message.seats);
+          writeSession({ kind: "room", code: info.roomCode, token: info.token });
           setResuming(false);
+          setError(null);
+          break;
         }
-        break;
-      }
-      case "room": {
-        const info: RoomInfo = {
-          roomCode: message.roomCode,
-          seat: message.seat,
-          token: message.token,
-          hostSeat: message.hostSeat,
-          started: message.started,
-        };
-        setRoom(info);
-        setSeats(message.seats);
-        writeSession({ roomCode: info.roomCode, token: info.token });
-        setResuming(false);
-        setError(null);
-        break;
-      }
-      case "state":
-        setView(message.view);
-        setHash(message.hash);
-        setSeq(message.seq);
-        setDeadline(message.deadline);
-        setSeats(message.seats);
-        setResuming(false);
-        setError(null);
-        break;
-      case "error":
-        setResuming(false);
-        setError({ code: message.code, message: message.message });
-        if (
-          message.code === "bad-token" ||
-          message.code === "room-not-found" ||
-          message.code === "room-expired" ||
-          message.code === "room-closed"
-        ) {
-          clearSession();
-          resumedRef.current = false;
+        case "state":
+          setView(message.view);
+          setHash(message.hash);
+          setSeq(message.seq);
+          setDeadline(message.deadline);
+          setSeats(message.seats);
+          setResuming(false);
+          setError(null);
+          break;
+        case "tournament": {
+          setTournament(message.tournament);
           setRoom(null);
-          setView(null);
-          setSeats([]);
+          setResuming(false);
+          setError(null);
+          const match = message.tournament.selfMatch;
+          if (!match || match.status !== "game") clearMatchState();
+          if (message.tournament.token) {
+            writeSession({
+              kind: "tournament",
+              code: message.tournament.code,
+              token: message.tournament.token,
+            });
+          }
+          break;
         }
-        break;
-      case "pong":
-        break;
-    }
-  }, [send]);
+        case "tstate":
+          setView(message.view);
+          setHash(message.hash);
+          setSeq(message.seq);
+          setDeadline(message.deadline);
+          setSeats(message.seats);
+          setResuming(false);
+          setError(null);
+          break;
+        case "error":
+          setResuming(false);
+          setError({ code: message.code, message: message.message });
+          if (FATAL_SESSION_CODES.has(message.code)) {
+            clearSession();
+            resumedRef.current = false;
+            setRoom(null);
+            setTournament(null);
+            clearMatchState();
+            setSeats([]);
+          }
+          break;
+        case "pong":
+          break;
+      }
+    },
+    [send, clearMatchState],
+  );
 
   useEffect(() => {
     shouldReconnect.current = true;
@@ -235,24 +299,62 @@ export function useOnline() {
   const start = useCallback(() => send({ type: "start" }), [send]);
   const act = useCallback((action: Action) => send({ type: "action", action }), [send]);
 
-  const leave = useCallback(() => {
-    send({ type: "leave" });
+  const createTournament = useCallback(
+    (name: string) => {
+      setError(null);
+      setResuming(false);
+      resumedRef.current = true;
+      send({ type: "tcreate", name });
+    },
+    [send],
+  );
+
+  const joinTournament = useCallback(
+    (code: string, name: string) => {
+      setError(null);
+      setResuming(false);
+      resumedRef.current = true;
+      send({ type: "tjoin", code, name });
+    },
+    [send],
+  );
+
+  const startTournament = useCallback(() => send({ type: "tstart" }), [send]);
+  const pickStellas = useCallback(
+    (stellas: string[]) => send({ type: "tpick", stellas }),
+    [send],
+  );
+  const banStella = useCallback((stellaId: string) => send({ type: "tban", stellaId }), [send]);
+  const submitTournamentDeck = useCallback(
+    (deck: CustomDeckInput) => send({ type: "tdeck", deck }),
+    [send],
+  );
+  const tournamentAct = useCallback(
+    (action: Action) => send({ type: "taction", action }),
+    [send],
+  );
+
+  const clearAll = useCallback(() => {
     clearSession();
     resumedRef.current = false;
     setRoom(null);
-    setView(null);
+    setTournament(null);
     setSeats([]);
-    setHash("");
-    setSeq(0);
-    setDeadline(null);
+    clearMatchState();
     setError(null);
     setResuming(false);
-  }, [send]);
+  }, [clearMatchState]);
+
+  const leave = useCallback(() => {
+    send(tournament ? { type: "tleave" } : { type: "leave" });
+    clearAll();
+  }, [send, clearAll, tournament]);
 
   return {
     connected,
     resuming,
     room,
+    tournament,
     seats,
     view,
     hash,
@@ -266,6 +368,13 @@ export function useOnline() {
     start,
     act,
     leave,
+    createTournament,
+    joinTournament,
+    startTournament,
+    pickStellas,
+    banStella,
+    submitTournamentDeck,
+    tournamentAct,
   };
 }
 

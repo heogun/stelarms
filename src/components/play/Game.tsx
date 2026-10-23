@@ -65,6 +65,13 @@ function basicHint(kind: BasicAction): string {
   }
 }
 
+function formatClock(seconds: number | null): string {
+  if (seconds === null) return "—";
+  const min = Math.floor(seconds / 60);
+  const sec = seconds % 60;
+  return `${min}:${String(sec).padStart(2, "0")}`;
+}
+
 function rangeOf(card: Card): [number, number] | null {
   if (card.range === undefined) return null;
   return Array.isArray(card.range) ? card.range : [card.range, card.range];
@@ -81,7 +88,9 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
   const foeSeat = view.seat === 0 ? 1 : 0;
   const foeInfo = online.seats[foeSeat];
   const foeConnected = foeInfo ? foeInfo.connected : true;
+  const act = online.tournament ? online.tournamentAct : online.act;
   const seconds = useCountdown(online.deadline);
+  const matchSeconds = useCountdown(online.tournament?.selfMatch?.gameDeadline ?? null);
   const logRef = useAutoScroll<HTMLDivElement>(view.log.length);
 
   // pending이 바뀌면 이전 선택을 자동으로 무시한다. key가 다르면 파생값이 비어 있다.
@@ -234,14 +243,14 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
       payment.pay === "focus"
         ? { type: "basic", action: kind, pay: "focus" }
         : { type: "basic", action: kind, pay: "hand", handUid: payment.handUid };
-    online.act(action);
+    act(action);
     if (payment.pay === "hand") setSelected(null);
   };
 
   const playSelected = () => {
     if (!selectedEntry) return;
     if (playBlocker({ cardId: selectedEntry.cardId, used: selectedUsed })) return;
-    online.act({ type: "playCard", uid: selectedEntry.uid });
+    act({ type: "playCard", uid: selectedEntry.uid });
     setSelected(null);
   };
 
@@ -316,9 +325,18 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
     <div className="game">
       <header className="game__bar">
         <div className="game__meta">
-          <span className="game__room">방 {online.room?.roomCode ?? "—"}</span>
+          <span className="game__room">
+            {online.tournament
+              ? `대회 ${online.tournament.code}`
+              : `방 ${online.room?.roomCode ?? "—"}`}
+          </span>
           <span className="game__round">{view.round}라운드</span>
           <span className="game__phase">{PHASE_LABEL[view.phase] ?? view.phase}</span>
+          {online.tournament && (
+            <span className="game__match-timer" title="토너먼트 경기 제한 시간">
+              경기 {formatClock(matchSeconds)}
+            </span>
+          )}
         </div>
         <div className={`game__turn ${isMyTurn ? "game__turn--mine" : ""}`}>
           <span>{turnLabel}</span>
@@ -515,7 +533,7 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
                       className="btn"
                       disabled={!isMyTurn || Boolean(mine) || you.flags.basicsUsed > 0}
                       title="기본동작 대신 카드 1장을 사용하는 행동 모드"
-                      onClick={() => online.act({ type: "declarePower" })}
+                      onClick={() => act({ type: "declarePower" })}
                     >
                       전력 행동
                     </button>
@@ -534,7 +552,7 @@ export function Game({ online, view }: { online: Online; view: PlayerView }) {
                         ? "전력 행동에서는 카드 1장을 사용해야 합니다."
                         : "턴 종료"
                     }
-                    onClick={() => online.act({ type: "endTurn" })}
+                    onClick={() => act({ type: "endTurn" })}
                   >
                     턴 종료
                   </button>
@@ -670,6 +688,7 @@ function PendingBox({
   moveOrder: (index: number, delta: number) => void;
   responseCards: { uid: string; cardId: string; card: Card | undefined; special: boolean }[];
 }) {
+  const act = online.tournament ? online.tournamentAct : online.act;
   switch (mine.kind) {
     case "mulligan":
       return (
@@ -684,7 +703,7 @@ function PendingBox({
             <button
               type="button"
               className="btn btn--primary"
-              onClick={() => online.act({ type: "mulligan", returnUids: mulligan })}
+              onClick={() => act({ type: "mulligan", returnUids: mulligan })}
             >
               {mulligan.length === 0 ? "그대로 시작" : `${mulligan.length}장 교체`}
             </button>
@@ -713,7 +732,7 @@ function PendingBox({
             <button
               type="button"
               className="btn btn--primary"
-              onClick={() => online.act({ type: "startPhase", recompose })}
+              onClick={() => act({ type: "startPhase", recompose })}
             >
               시작
             </button>
@@ -737,7 +756,7 @@ function PendingBox({
                   className="btn"
                   disabled={blocked}
                   title={blocked ? "플레어가 부족합니다." : cardName(entry.cardId)}
-                  onClick={() => online.act({ type: "response", uid: entry.uid })}
+                  onClick={() => act({ type: "response", uid: entry.uid })}
                 >
                   【{cardName(entry.cardId)}】
                   {entry.special ? ` (플레어 ${cost})` : ""}
@@ -748,7 +767,7 @@ function PendingBox({
             <button
               type="button"
               className="btn btn--ghost"
-              onClick={() => online.act({ type: "response" })}
+              onClick={() => act({ type: "response" })}
             >
               대응하지 않는다
             </button>
@@ -767,7 +786,7 @@ function PendingBox({
               type="button"
               className="btn"
               disabled={mine.attack.aura <= 0 || view.you.aura < mine.attack.aura}
-              onClick={() => online.act({ type: "defend", choice: "aura" })}
+              onClick={() => act({ type: "defend", choice: "aura" })}
             >
               오라로 받기 (-{mine.attack.aura})
             </button>
@@ -775,7 +794,7 @@ function PendingBox({
               type="button"
               className="btn btn--danger"
               disabled={mine.attack.life <= 0}
-              onClick={() => online.act({ type: "defend", choice: "life" })}
+              onClick={() => act({ type: "defend", choice: "life" })}
             >
               라이프로 받기 (-{mine.attack.life})
             </button>
@@ -799,7 +818,7 @@ function PendingBox({
               type="button"
               className="btn btn--primary"
               disabled={discardPick.length !== discardNeed}
-              onClick={() => online.act({ type: "discardDown", uids: discardPick })}
+              onClick={() => act({ type: "discardDown", uids: discardPick })}
             >
               덮음패로
             </button>
@@ -817,14 +836,14 @@ function PendingBox({
               type="button"
               className="btn"
               disabled={view.you.aura <= 0}
-              onClick={() => online.act({ type: "penalty", choice: "aura" })}
+              onClick={() => act({ type: "penalty", choice: "aura" })}
             >
               오라 1 지불
             </button>
             <button
               type="button"
               className="btn btn--danger"
-              onClick={() => online.act({ type: "penalty", choice: "life" })}
+              onClick={() => act({ type: "penalty", choice: "life" })}
             >
               라이프 1 지불
             </button>
@@ -852,7 +871,7 @@ function PendingBox({
                 key={option.id}
                 type="button"
                 className="btn btn--primary"
-                onClick={() => online.act({ type: "choice", optionId: option.id })}
+                onClick={() => act({ type: "choice", optionId: option.id })}
               >
                 {option.label}
               </button>
@@ -899,7 +918,7 @@ function PendingBox({
             <button
               type="button"
               className="btn btn--primary"
-              onClick={() => online.act({ type: "order", uids })}
+              onClick={() => act({ type: "order", uids })}
             >
               {reorder ? "이 순서로 확정" : "확인"}
             </button>

@@ -44,6 +44,8 @@ export function Lobby({ online }: { online: Online }) {
   const [customDeck] = useState(readValidCustomDeck);
   const [selection, setSelection] = useState<DeckSelection>(readDeckSelection);
   const [joinCode, setJoinCode] = useState("");
+  const [tournamentCode, setTournamentCode] = useState("");
+  const [mode, setMode] = useState<"casual" | "tournament">("casual");
   const [copied, setCopied] = useState(false);
 
   const preset =
@@ -92,6 +94,18 @@ export function Lobby({ online }: { online: Online }) {
     online.join(code, name, choice);
   };
 
+  const createTournament = () => {
+    if (!online.connected) return;
+    online.createTournament(name);
+  };
+
+  const joinTournament = () => {
+    if (!online.connected) return;
+    const code = tournamentCode.trim().toUpperCase();
+    if (!code) return;
+    online.joinTournament(code, name);
+  };
+
   const error = online.error && (
     <p className="play__error" role="alert">
       {online.error.message}
@@ -129,19 +143,39 @@ export function Lobby({ online }: { online: Online }) {
   );
 
   if (!online.room) {
+    const tournamentMode = mode === "tournament";
     return (
       <div className="lobby">
         <section className="lobby__hero">
-          <h2>온라인 대전</h2>
-          <p>
-            서버가 모든 판정과 정보 은닉을 담당합니다. 추천 덱 14개 또는 덱
-            빌더에서 만든 커스텀 덱으로 방 코드를 공유해 만나세요.
-          </p>
+          <h2>{tournamentMode ? "토너먼트" : "온라인 대전"}</h2>
+          {tournamentMode ? (
+            <p>
+              4~8명이 모여 3라운드 스위스와 4강·결승을 치릅니다. 매 경기 전
+              삼습일사로 스텔라 3명을 고르고, 상대가 1명을 밴하면 남은 2명으로
+              7+3 덱을 만듭니다.
+            </p>
+          ) : (
+            <p>
+              서버가 모든 판정과 정보 은닉을 담당합니다. 추천 덱 14개 또는 덱
+              빌더에서 만든 커스텀 덱으로 방 코드를 공유해 만나세요.
+            </p>
+          )}
           <ul className="lobby__notes">
-            <li>카드 효과·덱·시드는 서버가 검증합니다.</li>
-            <li>커스텀 덱도 통상 7 + 비장 3, 스텔라 소속·중복을 다시 확인합니다.</li>
-            <li>상대 손패·패산·덮음패는 클라이언트로 전송되지 않습니다.</li>
-            <li>연결이 끊겨도 같은 브라우저 탭에서 자동으로 재접속합니다.</li>
+            {tournamentMode ? (
+              <>
+                <li>참가자는 4~8명. 모든 참가자가 연결되어야 시작합니다.</li>
+                <li>3라운드 스위스 후 상위 4명이 4강·결승에 진출합니다.</li>
+                <li>삼습일사: 3명 픽 → 상대 1명 밴 → 최종 2명으로 7+3 덱.</li>
+                <li>준비 5분·경기 25분 제한. 결과와 브래킷은 서버가 관리합니다.</li>
+              </>
+            ) : (
+              <>
+                <li>카드 효과·덱·시드는 서버가 검증합니다.</li>
+                <li>커스텀 덱도 통상 7 + 비장 3, 스텔라 소속·중복을 다시 확인합니다.</li>
+                <li>상대 손패·패산·덮음패는 클라이언트로 전송되지 않습니다.</li>
+                <li>연결이 끊겨도 같은 브라우저 탭에서 자동으로 재접속합니다.</li>
+              </>
+            )}
           </ul>
         </section>
 
@@ -149,6 +183,27 @@ export function Lobby({ online }: { online: Online }) {
           <div className="lobby__status">
             <span className={`dot ${online.connected ? "dot--on" : "dot--off"}`} />
             {online.connected ? "서버 연결됨" : "서버 연결 중…"}
+          </div>
+
+          <div className="lobby__modes" role="tablist" aria-label="대전 모드">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={!tournamentMode}
+              className={!tournamentMode ? "active" : ""}
+              onClick={() => setMode("casual")}
+            >
+              캐주얼
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tournamentMode}
+              className={tournamentMode ? "active" : ""}
+              onClick={() => setMode("tournament")}
+            >
+              토너먼트
+            </button>
           </div>
 
           <label className="field">
@@ -161,51 +216,102 @@ export function Lobby({ online }: { online: Online }) {
             />
           </label>
 
-          <label className="field">
-            <span>내 덱</span>
-            <select value={selectValue} onChange={(e) => changeDeck(e.target.value)}>
-              {deckOptions}
-            </select>
-          </label>
-          {customNote}
+          {!tournamentMode && (
+            <>
+              <label className="field">
+                <span>내 덱</span>
+                <select value={selectValue} onChange={(e) => changeDeck(e.target.value)}>
+                  {deckOptions}
+                </select>
+              </label>
+              {customNote}
+              <DeckPreview deck={preview} />
+            </>
+          )}
 
-          <DeckPreview deck={preview} />
+          {tournamentMode && (
+            <div className="lobby__tournament-note">
+              <b>삼습일사 · 3라운드 스위스</b>
+              <p>
+                대회에서는 덱을 미리 고르지 않습니다. 각 경기 전 상대와 픽·밴을
+                마친 뒤 남은 2명으로 덱을 구성합니다.
+              </p>
+            </div>
+          )}
 
           {error}
 
-          <div className="lobby__actions">
-            <button
-              type="button"
-              className="btn btn--primary"
-              disabled={!online.connected}
-              onClick={create}
-            >
-              방 만들기
-            </button>
-          </div>
-
-          <div className="lobby__join">
-            <label className="field">
-              <span>방 코드</span>
-              <input
-                value={joinCode}
-                maxLength={6}
-                placeholder="6자리"
-                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") join();
-                }}
-              />
-            </label>
-            <button
-              type="button"
-              className="btn"
-              disabled={!online.connected || joinCode.trim().length !== 6}
-              onClick={join}
-            >
-              참가
-            </button>
-          </div>
+          {tournamentMode ? (
+            <>
+              <div className="lobby__actions">
+                <button
+                  type="button"
+                  className="btn btn--primary"
+                  disabled={!online.connected}
+                  onClick={createTournament}
+                >
+                  대회 만들기
+                </button>
+              </div>
+              <div className="lobby__join">
+                <label className="field">
+                  <span>대회 코드</span>
+                  <input
+                    value={tournamentCode}
+                    maxLength={6}
+                    placeholder="6자리"
+                    onChange={(e) => setTournamentCode(e.target.value.toUpperCase())}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") joinTournament();
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!online.connected || tournamentCode.trim().length !== 6}
+                  onClick={joinTournament}
+                >
+                  참가
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="lobby__actions">
+                <button
+                  type="button"
+                  className="btn btn--primary"
+                  disabled={!online.connected}
+                  onClick={create}
+                >
+                  방 만들기
+                </button>
+              </div>
+              <div className="lobby__join">
+                <label className="field">
+                  <span>방 코드</span>
+                  <input
+                    value={joinCode}
+                    maxLength={6}
+                    placeholder="6자리"
+                    onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") join();
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!online.connected || joinCode.trim().length !== 6}
+                  onClick={join}
+                >
+                  참가
+                </button>
+              </div>
+            </>
+          )}
         </section>
       </div>
     );
