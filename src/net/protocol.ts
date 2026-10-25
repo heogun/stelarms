@@ -164,7 +164,6 @@ export type ServerMessage =
       hash: string;
       seq: number;
       deadline: number | null;
-      seats: (LobbySeat | null)[];
     }
   | {
       type: "tournament";
@@ -177,7 +176,6 @@ export type ServerMessage =
       hash: string;
       seq: number;
       deadline: number | null;
-      seats: (LobbySeat | null)[];
     }
   | { type: "error"; code: string; message: string }
   | { type: "pong"; serverTime: number };

@@ -12,14 +12,13 @@ import {
   toPlayerView,
 } from "../src/engine";
 import type { Action, GameState, PlayerId } from "../src/engine";
-import { resolveDeckChoice, seatDeckFor } from "../src/net/deckChoice";
+import { resolveDeckChoice } from "../src/net/deckChoice";
 import type { ResolvedDeck } from "../src/net/deckChoice";
 import {
   MAX_NAME_LENGTH,
   ROOM_CODE_LENGTH,
 } from "../src/net/protocol";
 import type {
-  LobbySeat,
   ServerMessage,
   TournamentBracketMatchView,
   TournamentMatchPlayer,
@@ -136,9 +135,10 @@ const clientIndex = new Map<string, ClientEntry>();
 
 /* ────────────────────────────── 유틸 ────────────────────────────── */
 
+import { encodeServer } from "../src/net/codec";
 function send(client: SocketClient, message: ServerMessage): void {
   try {
-    client.ws.send(JSON.stringify(message));
+    client.ws.send(encodeServer(message));
   } catch {
     // 닫힌 소켓은 close 핸들러가 정리한다.
   }
@@ -344,23 +344,7 @@ function buildTournamentView(tournament: Tournament, selfId: string): Tournament
   };
 }
 
-function lobbySeatsForMatch(
-  tournament: Tournament,
-  match: TournamentMatch,
-  viewerSeat: PlayerId,
-): (LobbySeat | null)[] {
-  return ([0, 1] as const).map((seat) => {
-    const participant = participantAt(tournament, match, seat);
-    if (!participant) return null;
-    const deck = match.draft.decks[seat];
-    return {
-      seat,
-      name: participant.name,
-      deck: deck ? seatDeckFor(deck, viewerSeat, seat) : null,
-      connected: participant.connected,
-    };
-  });
-}
+
 
 function sendTournament(tournament: Tournament, participant: Participant): void {
   if (!participant.client) return;
@@ -386,7 +370,6 @@ function sendMatchState(tournament: Tournament, match: TournamentMatch): void {
       hash: match.hash,
       seq: match.seq,
       deadline: match.deadline,
-      seats: lobbySeatsForMatch(tournament, match, seat),
     });
   }
 }

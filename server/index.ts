@@ -21,6 +21,7 @@ import {
   ROOM_CODE_LENGTH,
 } from "../src/net/protocol";
 import type { ClientMessage, LobbySeat, ServerMessage } from "../src/net/protocol";
+import { decodeClient } from "../src/net/codec";
 import { defaultAction } from "./defaultAction";
 import {
   createTournament,
@@ -50,6 +51,18 @@ const MAX_CLIENTS = 4_000;
 const MAX_ACTIONS = 4_000;
 const RATE_CAPACITY = 12;
 const RATE_PER_SEC = 6;
+// HTTP/WS 연결 보호 (트래픽/연결 폭주 방지)
+const HTTP_RATE_WINDOW_MS = 60_000;
+const HTTP_RATE_MAX = 240; // IP당 분당 요청 수
+const WS_UPGRADE_RATE_WINDOW_MS = 60_000;
+const WS_UPGRADE_RATE_MAX = 30; // IP당 분당 WS 업그레이드 시도
+const WS_CONNS_PER_IP_MAX = 16; // IP당 동시 WS 연결 수
+const TRUST_PROXY = process.env.RENDER === "true" || process.env.TRUST_PROXY === "true";
+const INSTANCE_ID = process.env.INSTANCE_ID ?? crypto.randomUUID();
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const DIST_DIR = `${process.cwd()}/dist`;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -57,7 +70,7 @@ const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 interface Client {
   id: string;
-  ws: BunWebSocket<{ id: string }>;
+  ws: BunWebSocket<{ id: string; ip?: string }>;
   room: Room | null;
   seat: PlayerId | null;
   token: string | null;
@@ -92,11 +105,17 @@ const clients = new Map<string, Client>();
 const rooms = new Map<string, Room>();
 const tokens = new Map<string, { room: Room; seat: PlayerId }>();
 
+// IP별 보호 상태
+const httpRate = new Map<string, { count: number; resetAt: number }>();
+const wsUpgradeRate = new Map<string, { count: number; resetAt: number }>();
+const wsConnsByIp = new Map<string, number>();
+
 /* ────────────────────────────── 유틸 ────────────────────────────── */
 
+import { encodeServer } from "../src/net/codec";
 function send(ws: BunWebSocket<{ id: string }>, message: ServerMessage): void {
   try {
-    ws.send(JSON.stringify(message));
+    ws.send(encodeServer(message));
   } catch {
     // 이미 닫힌 소켓은 close 핸들러가 정리한다.
   }
@@ -147,6 +166,62 @@ function rateAllowed(client: Client): boolean {
   if (client.bucket.tokens < 1) return false;
   client.bucket.tokens -= 1;
   return true;
+}
+
+function clientIp(req: Request, server: any): string {
+  if (TRUST_PROXY) {
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) {
+      const first = xff.split(",")[0]?.trim();
+      if (first) return first;
+    }
+    const realIp = req.headers.get("x-real-ip");
+    if (realIp?.trim()) return realIp.trim();
+  }
+  try {
+    const ip = server.requestIP?.(req);
+    if (ip?.address) return ip.address;
+  } catch {
+    // ignore
+  }
+  return "unknown";
+}
+
+function checkHttpRate(ip: string): boolean {
+  const now = Date.now();
+  const entry = httpRate.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    httpRate.set(ip, { count: 1, resetAt: now + HTTP_RATE_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= HTTP_RATE_MAX) return false;
+  entry.count += 1;
+  return true;
+}
+
+function checkWsUpgradeRate(ip: string): boolean {
+  const now = Date.now();
+  const entry = wsUpgradeRate.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    wsUpgradeRate.set(ip, { count: 1, resetAt: now + WS_UPGRADE_RATE_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= WS_UPGRADE_RATE_MAX) return false;
+  entry.count += 1;
+  return true;
+}
+
+function incWsIp(ip: string): boolean {
+  const n = (wsConnsByIp.get(ip) ?? 0) + 1;
+  if (n > WS_CONNS_PER_IP_MAX) return false;
+  wsConnsByIp.set(ip, n);
+  return true;
+}
+
+function decWsIp(ip: string): void {
+  const n = (wsConnsByIp.get(ip) ?? 0) - 1;
+  if (n <= 0) wsConnsByIp.delete(ip);
+  else wsConnsByIp.set(ip, n);
 }
 
 function actorOf(state: GameState): PlayerId {
@@ -228,7 +303,6 @@ function stateMessage(room: Room, seat: PlayerId): ServerMessage | null {
     hash: room.hash,
     seq: room.seq,
     deadline: room.deadline,
-    seats: lobbySeats(room, seat),
   };
 }
 
@@ -546,7 +620,7 @@ function handleMessage(client: Client, raw: string | Uint8Array): void {
   let message: ClientMessage;
   try {
     const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
-    const parsed: unknown = JSON.parse(text);
+    const parsed = decodeClient(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object");
     const type = (parsed as { type?: unknown }).type;
     if (typeof type !== "string") throw new Error("type");
@@ -708,18 +782,59 @@ const MIME: Record<string, string> = {
   md: "text/markdown; charset=utf-8",
 };
 
-async function serveStatic(req: Request): Promise<Response> {
+function securityHeaders(h: Headers): Headers {
+  h.set("X-Content-Type-Options", "nosniff");
+  h.set("X-Frame-Options", "SAMEORIGIN");
+  h.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  h.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  h.set("Cross-Origin-Opener-Policy", "same-origin");
+  h.set("Cross-Origin-Resource-Policy", "same-origin");
+  return h;
+}
+
+async function serveStatic(req: Request, server: any): Promise<Response> {
+  const ip = clientIp(req, server);
   const url = new URL(req.url);
-  if (url.pathname === "/health") {
-    return Response.json({
+  if (url.pathname === "/health" || url.pathname === "/livez") {
+    // Render 헬스체크는 짧게, 과도한 재시도 방지를 위해 약간 여유
+    if (!checkHttpRate(ip)) {
+      const h = securityHeaders(new Headers({ "retry-after": "60", "content-type": "application/json; charset=utf-8" }));
+      return new Response(JSON.stringify({ ok: false, error: "rate-limit" }), { status: 429, headers: h });
+    }
+    const h = securityHeaders(new Headers({ "content-type": "application/json; charset=utf-8" }));
+    const body = JSON.stringify({
       ok: true,
+      live: true,
+      instanceId: INSTANCE_ID,
       rooms: rooms.size,
       tournaments: tournamentCount(),
       clients: clients.size,
     });
+    return new Response(body, { status: 200, headers: h });
+  }
+  if (url.pathname === "/readyz") {
+    if (!checkHttpRate(ip)) {
+      const h = securityHeaders(new Headers({ "retry-after": "60", "content-type": "application/json; charset=utf-8" }));
+      return new Response(JSON.stringify({ ok: false, error: "rate-limit" }), { status: 429, headers: h });
+    }
+    const h = securityHeaders(new Headers({ "content-type": "application/json; charset=utf-8" }));
+    const body = JSON.stringify({
+      ok: true,
+      ready: true,
+      instanceId: INSTANCE_ID,
+      rooms: rooms.size,
+      tournaments: tournamentCount(),
+      clients: clients.size,
+    });
+    return new Response(body, { status: 200, headers: h });
   }
   if (url.pathname === "/ws") {
     return new Response("WebSocket only", { status: 400 });
+  }
+
+  if (!checkHttpRate(ip)) {
+    const h = securityHeaders(new Headers({ "retry-after": "60", "content-type": "text/plain; charset=utf-8" }));
+    return new Response("rate limited", { status: 429, headers: h });
   }
 
   let pathname: string;
@@ -740,8 +855,9 @@ async function serveStatic(req: Request): Promise<Response> {
     const file = Bun.file(`${DIST_DIR}/${rel}`);
     if (await file.exists()) {
       const ext = rel.split(".").pop()?.toLowerCase() ?? "";
+      const h = securityHeaders(new Headers({ "content-type": MIME[ext] ?? "application/octet-stream", "cache-control": cache }));
       return new Response(file, {
-        headers: { "content-type": MIME[ext] ?? "application/octet-stream", "cache-control": cache },
+        headers: h,
       });
     }
   }
@@ -750,35 +866,52 @@ async function serveStatic(req: Request): Promise<Response> {
   if (!rel.includes(".")) {
     const index = Bun.file(`${DIST_DIR}/index.html`);
     if (await index.exists()) {
+      const h = securityHeaders(new Headers({ "content-type": MIME.html, "cache-control": "no-cache" }));
       return new Response(index, {
-        headers: { "content-type": MIME.html, "cache-control": "no-cache" },
+        headers: h,
       });
     }
   }
+  const h = securityHeaders(new Headers({ "content-type": MIME.txt }));
   return new Response("STELARMS 서버 실행 중. UI는 `bun run build` 후 dist에 있습니다.", {
     status: 404,
-    headers: { "content-type": MIME.txt },
+    headers: h,
   });
 }
 
 /* ────────────────────────────── 서버 ────────────────────────────── */
 
-const server = Bun.serve<{ id: string }>({
+const server = Bun.serve<{ id: string; ip?: string }>({
   port: PORT,
   hostname: HOST,
   development: process.env.NODE_ENV !== "production",
   async fetch(req, bunServer) {
     const url = new URL(req.url);
     if (url.pathname === "/ws") {
+      const ip = clientIp(req, bunServer);
+      if (!checkWsUpgradeRate(ip)) {
+        return new Response("rate limited", { status: 429 });
+      }
+      if (!incWsIp(ip)) {
+        return new Response("too many connections from ip", { status: 429 });
+      }
       if (clients.size >= MAX_CLIENTS) {
+        decWsIp(ip);
         return new Response("too many clients", { status: 503 });
       }
+      if (ALLOWED_ORIGINS.length > 0) {
+        const origin = req.headers.get("origin");
+        if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+          return new Response("forbidden origin", { status: 403 });
+        }
+      }
       const id = crypto.randomUUID();
-      const upgraded = bunServer.upgrade(req, { data: { id } });
+      const upgraded = (bunServer as any).upgrade(req, { data: { id, ip } });
       if (upgraded) return undefined;
+      decWsIp(ip);
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
-    return serveStatic(req);
+    return serveStatic(req, bunServer);
   },
   websocket: {
     open(ws) {
@@ -806,6 +939,9 @@ const server = Bun.serve<{ id: string }>({
     close(ws) {
       const client = clients.get(ws.data.id);
       if (!client) return;
+      const data = ws.data as { id: string; ip?: string };
+      const ip = data.ip;
+      if (ip) decWsIp(ip);
       clients.delete(client.id);
       detachTournamentClient(client.id);
       const room = client.room;
@@ -858,5 +994,46 @@ setInterval(() => {
   }
 }, 60_000);
 
-console.log(`STELARMS server on http://${HOST}:${server.port} (ws://.../ws)`);
-console.log(`turn timeout: ${TURN_MS}ms, rooms: ${rooms.size}, tournaments: ${tournamentCount()}`);
+console.log(`STELARMS server on http://${HOST}:${server.port} (ws://.../ws) [instance:${INSTANCE_ID}]`);
+console.log(`turn timeout: ${TURN_MS}ms, rooms: ${rooms.size}, tournaments: ${tournamentCount()}, trustProxy:${TRUST_PROXY}, allowedOrigins:${ALLOWED_ORIGINS.length || "any"}`);
+
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${INSTANCE_ID}] shutting down (${signal})...`);
+  try {
+    // 연결된 클라이언트에게 정리 알림 후 종료 유도
+    for (const client of clients.values()) {
+      try {
+        sendError(client, "server-shutdown", "서버가 재시작됩니다. 잠시 후 다시 연결해주세요.");
+        client.ws.close(1012, "service restart");
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    // 타이머 정리
+    for (const room of rooms.values()) {
+      if (room.timer) {
+        clearTimeout(room.timer);
+        room.timer = null;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    server.stop();
+  } catch {
+    // ignore
+  }
+  // 짧은 대기 후 종료
+  setTimeout(() => process.exit(0), 500);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

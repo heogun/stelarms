@@ -37,6 +37,7 @@ interface BunServer {
   port: number;
   hostname: string;
   stop(): void;
+  requestIP?(req: Request): { address: string; family?: string; port?: number } | null;
 }
 
 declare const Bun: {
@@ -49,4 +50,6 @@ declare const process: {
   env: Record<string, string | undefined>;
   argv: string[];
   cwd(): string;
+  exit(code?: number): never;
+  on(event: string, listener: (...args: any[]) => void): void;
 };

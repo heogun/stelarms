@@ -15,6 +15,8 @@ import type {
   ServerMessage,
   TournamentView,
 } from "./protocol";
+import { decodeServer } from "./codec";
+import { encodeClient } from "./codec";
 
 const SESSION_KEY = "stelarms.session.v2";
 const LEGACY_ROOM_SESSION_KEY = "stelarms.session.v1";
@@ -120,7 +122,7 @@ export function useOnline() {
   const send = useCallback((message: ClientMessage): boolean => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(message));
+    socket.send(encodeClient(message));
     return true;
   }, []);
 
@@ -169,15 +171,16 @@ export function useOnline() {
           setError(null);
           break;
         }
-        case "state":
-          setView(message.view);
-          setHash(message.hash);
-          setSeq(message.seq);
-          setDeadline(message.deadline);
-          setSeats(message.seats);
+        case "state": {
+          const m = message as Extract<ServerMessage, { type: "state" }>;
+          setView(m.view);
+          setHash(m.hash);
+          setSeq(m.seq);
+          setDeadline(m.deadline);
           setResuming(false);
           setError(null);
           break;
+        }
         case "tournament": {
           setTournament(message.tournament);
           setRoom(null);
@@ -194,15 +197,16 @@ export function useOnline() {
           }
           break;
         }
-        case "tstate":
-          setView(message.view);
-          setHash(message.hash);
-          setSeq(message.seq);
-          setDeadline(message.deadline);
-          setSeats(message.seats);
+        case "tstate": {
+          const m = message as Extract<ServerMessage, { type: "tstate" }>;
+          setView(m.view);
+          setHash(m.hash);
+          setSeq(m.seq);
+          setDeadline(m.deadline);
           setResuming(false);
           setError(null);
           break;
+        }
         case "error":
           setResuming(false);
           setError({ code: message.code, message: message.message });
@@ -238,8 +242,13 @@ export function useOnline() {
       };
       socket.onmessage = (event) => {
         try {
-          const message = JSON.parse(String(event.data)) as ServerMessage;
-          handle(message);
+          const decoded = decodeServer(String(event.data));
+          if (decoded) {
+            const message = decoded as ServerMessage;
+            handle(message);
+          } else {
+            throw new Error("bad");
+          }
         } catch {
           setError({ code: "bad-message", message: "서버 응답을 읽을 수 없습니다." });
         }
@@ -271,7 +280,7 @@ export function useOnline() {
   // 30초마다 핑 (프록시 유휴 연결 정리 방지)
   useEffect(() => {
     if (!connected) return;
-    const id = window.setInterval(() => send({ type: "ping" }), 30_000);
+    const id = window.setInterval(() => send({ type: "ping" }), 45_000);
     return () => window.clearInterval(id);
   }, [connected, send]);
 
